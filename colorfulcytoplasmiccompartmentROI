@@ -1,0 +1,729 @@
+// Fiji/ImageJ macro
+// This script batch processes my images and measures A1 in NeuN-positive neurons
+
+//channel directory
+  // C1 = DAPI
+  // C2 = A1(antibody 1, this can be anything)
+  // C3 = NeuN
+  // C4 = not used right now
+  
+  //my workflow:
+  // 1. makes an roi per nucleus(dapi)
+  // 2. makes an roi per neuron(neun)
+  // 3. keeps only DAPI nuclei that match a NeuN-positive cells
+  // 4. makes the cytoplasm ROI by subtracting the nucleus from the whole cell
+  // 5. measures A1(or other protein of choice) in the nucleus, whole cell, and cytoplasm
+  // 6. This script will save the measurements, ROIs, and QC figures(for roi validation) for each image in the batch
+  
+  // IF I WANT TO CHANGE WHICH CHANNEL IS WHICH:
+    // Change ONLY the channel numbers under "CHANNEL NUMBERS" in the code below(not the example comment directly below, but the actual code)
+  // Example: if DAPI is C1, NeuN is C2, and A1 is C3:
+    // cDAPI = 1;
+    // cA1  = 3;
+    // cNeuN = 2;
+    
+    // IF I WANT TO MEASURE A DIFFERENT PROTEIN:
+      // Change cA1 to the number of the channel containing the new protein.
+    // Example: if TDP is C4, use cA1 = 4;
+    // I can also replace the word A1 in the output names, CSV columns, and QC labels(last part of script, compand f replace all for A1)
+    
+    //WHAT TO DO IF ADDING A FOURTH CHANNEL:
+      // Add cProtein2 = 4; then:
+        // 1. Add cProtein2 = 4 under "CHANNEL NUMBERS"
+        // 2. Change the channel check from dimC < 3 to dimC < 4
+        // 3. Add the Protein 2 channel title after Split Channels
+        // 4. Check that the Protein 2 channel opened
+        // 5. Save the Protein 2 image ID
+        // 6. Add Protein 2 columns to the CSV header
+        // 7. Measure Protein 2 in the nucleus, whole cell, and cytoplasm
+        // 8. Add those measurements to each CSV line
+        // 9. Add a Protein 2 QC panel if I want one
+        // Ready-to-paste examples are included at the bottom of this script.
+        
+        // OUTPUTS:
+          // results/A1_NeuN_single_cell_results.csv
+        // results/ROIs/<image>_paired_ROIs.zip
+        // results/QC_Figures/<image>_A-D panels and <image>_QC_montage.png
+        
+        // -------------------- FILE LOCATIONS --------------------
+          // change this to the directory/folder containing my files per project
+        inputDir  = "/Users/gracefields/Desktop/A1keap3/tiffs/";
+        //will make an output folder inside of the input folder for results
+        outputDir = inputDir + "results/";
+        //each cell roi if you want representative images etc of mislocalization
+        roiDir    = outputDir + "ROIs/";
+        //this is a quality check of my rois to see if anything within the script needs to be changed to optimize the script
+        qcDir     = outputDir + "QC_Figures/";
+        //acual file with the results
+        csvFile   = outputDir + "A1_NeuN_single_cell_results.csv";
+        
+        // -------------------- CHANNEL NUMBERS --------------------
+          // change these numbers if my channel order changes
+        cDAPI = 1;
+        cA1  = 2;
+        cNeuN = 3;
+        //cX = 4; //uncomment if using a third channel
+        // -------------------- THRESHOLD METHODS --------------------
+          // automatic thresholding used for each channel- this can be changed. thresholds can be set mannually within the script- look @ my xdpgliosis script if thresholding examples are needed
+        dapiMethod = "Otsu dark";
+        neunMethod = "Otsu dark";
+        A1Method  = "Otsu dark";
+        
+        // -------------------- SEGMENTATION SETTINGS --------------------
+        // otsu scales  lowered to keep dim but real nuclei and cell bodies
+        setOption("BlackBackground", true);
+        backgroundRadius = 35;
+        segmentationBlur = 1;
+        dapiOtsuScale = 0.60;
+        neunOtsuScale = 0.60;
+        
+        // minimum and maximum size allowed for nuclei and cell bodies to be counted as one cell v segmented v not counted
+        // double check pixel size in image j using the measurement tool for small nuclei and large, along with small neurons and large
+        dapiMinArea = 6;
+        dapiMaxArea = 1200;
+        neunMinArea = 30;
+        neunMaxArea = 1200;
+        
+        // true removes ROIs that touch the edge
+        // change to false if I want to keep them
+        excludeEdgeNuclei = true;
+        excludeEdgeCells  = true;
+        
+        // change to false if I do not want the ROI zip files
+        saveROIs = true;
+        
+        // -------------------- Set up output --------------------
+          if (!File.exists(outputDir)) File.makeDirectory(outputDir);
+        if (!File.exists(roiDir)) File.makeDirectory(roiDir);
+        if (!File.exists(qcDir)) File.makeDirectory(qcDir);
+        
+        //CHANGE IF IM CHANGING CHANNELS OR THIS BECOMES V CONA1ING
+        header =
+          "Image,Cell_ID," +
+          "Nucleus_Area,Nuclear_A1_Mean,Nuclear_A1_IntDen,Nuclear_A1_PercentArea,Nuclear_A1_PositiveArea," +
+          "Cell_Area,Cell_A1_Mean,Cell_A1_IntDen,Cell_A1_PercentArea,Cell_A1_PositiveArea," +
+          "Cytoplasm_Area,Cytoplasmic_A1_Mean,Cytoplasmic_A1_IntDen,Cytoplasmic_A1_PercentArea,Cytoplasmic_A1_PositiveArea," +
+          "Nuclear_to_Cytoplasmic_A1_Mean_Ratio\n";
+        File.saveString(header, csvFile);
+        
+        files = getFileList(inputDir);
+        if (files.length == 0) exit("No files found in: " + inputDir);
+        
+        run("Set Measurements...", "area mean integrated centroid area_fraction redirect=None decimal=4");
+        setOption("BlackBackground", true);
+        setBatchMode(true);
+        
+        processedImages = 0;
+        totalCells = 0;
+        
+        // -------------------- Main batch loop --------------------
+        // basically a loop of analysis til the script runs through the entire folder starting at f=0(image 1) and ending at <f++(last file)
+          for (f = 0; f < files.length; f++) {
+            fileName = files[f];
+            fullPath = inputDir + fileName;
+            
+            if (File.isDirectory(fullPath)) continue;
+            if (!isImageFile(fileName)) continue;
+            
+            print("\\Clear");
+            print("Processing: " + fileName);
+            
+            roiManager("Reset");
+            run("Clear Results");
+            
+            openImage(fullPath);
+            originalTitle = getTitle();
+            
+            // convert a grayscale 3-slice TIFF into a 3-channel image IF needed
+            //NEED TO CHANGE THIS WHOLE SECTION IF FOURTH CHANNEL PRESENT
+            getDimensions(dimW, dimH, dimC, dimZ, dimT);
+            if (dimC == 1 && dimZ == 3 && dimT == 1) {
+              run("Stack to Hyperstack...", "order=xyczt channels=3 slices=1 frames=1 display=Composite");
+              getDimensions(dimW, dimH, dimC, dimZ, dimT);
+            }
+            
+            if (dimC < 3) {
+              print("Skipped: fewer than 3 channels in " + fileName);
+              closeAllImages();
+              continue;
+            }
+            
+            // make a maximum-intensity projection only when a true Z-stack is present
+            //typically run through my z-stack -> max intensity script beforehand, but if not use this
+            if (dimZ > 1) {
+              run("Z Project...", "projection=[Max Intensity]");
+              closeImageByTitle(originalTitle);
+            }
+            
+            baseTitle = getTitle();
+            run("Split Channels");
+            //labling channels + making seperate files for each
+            dapiTitle = "C" + cDAPI + "-" + baseTitle;
+            A1Title  = "C" + cA1  + "-" + baseTitle;
+            neunTitle = "C" + cNeuN + "-" + baseTitle;
+            
+            if (!isOpen(dapiTitle) || !isOpen(A1Title) || !isOpen(neunTitle)) {
+              print("Skipped: expected DAPI, A1, and NeuN channels were not found.");
+              closeAllImages();
+              continue;
+            }
+            
+            selectWindow(A1Title);
+            A1ID = getImageID();
+            
+            //  A1 auto-threshold is used only to calculate PercentArea
+            // Mean and integrated density are calculated from the original A1 pixels
+            setAutoThreshold(A1Method);
+            
+            // -------------------- DAPI nuclear ROIs --------------------
+              selectWindow(dapiTitle);
+            run("Duplicate...", "title=DAPI_mask");
+            dapiMaskID = getImageID();
+            run("Subtract Background...", "rolling=" + backgroundRadius);
+            run("Gaussian Blur...", "sigma=" + segmentationBlur);
+            setAutoThreshold(dapiMethod);
+            getThreshold(dapiAutoLow, dapiAutoHigh);
+            dapiUsedLow = dapiAutoLow * dapiOtsuScale;
+            setThreshold(dapiUsedLow, dapiAutoHigh);
+            print("DAPI threshold used: " + d2s(dapiUsedLow, 0) + "-" + d2s(dapiAutoHigh, 0));
+            run("Convert to Mask");
+            //add an additional fill holes if roi is looking lumpy
+            run("Fill Holes");
+            run("Watershed");
+            
+            dapiOptions = "size=" + dapiMinArea + "-" + dapiMaxArea + " show=Nothing add";
+            if (excludeEdgeNuclei) dapiOptions = dapiOptions + " exclude";
+            run("Analyze Particles...", dapiOptions);
+            
+            nucleusCount = roiManager("Count");
+            if (nucleusCount == 0) {
+              print("Skipped: no DAPI nuclei were detected.");
+              closeAllImages();
+              roiManager("Reset");
+              continue;
+            }
+            
+            for (i = 0; i < nucleusCount; i++) {
+              roiManager("Select", i);
+              roiManager("Rename", "DAPI_candidate_" + padNumber(i + 1, 4));
+            }
+            
+            // -------------------- NeuN cell ROIs --------------------
+              selectWindow(neunTitle);
+            run("Duplicate...", "title=NeuN_mask");
+            neunMaskID = getImageID();
+            run("Subtract Background...", "rolling=" + backgroundRadius);
+            run("Gaussian Blur...", "sigma=" + segmentationBlur);
+            setAutoThreshold(neunMethod);
+            getThreshold(neunAutoLow, neunAutoHigh);
+            neunUsedLow = neunAutoLow * neunOtsuScale;
+            setThreshold(neunUsedLow, neunAutoHigh);
+            print("NeuN threshold used: " + d2s(neunUsedLow, 0) + "-" + d2s(neunAutoHigh, 0));
+            run("Convert to Mask");
+            // ImageJ calls the binary morphological Close command "Close-".
+            // "Close" without the hyphen closes the image window.
+            run("Close-");
+            run("Fill Holes");
+            // Separate touching NeuN-positive somas at their narrowest connection
+            // This prevents two adjacent neurons from becoming one cell ROI
+            run("Watershed");
+            
+            cellStart = roiManager("Count");
+            neunOptions = "size=" + neunMinArea + "-" + neunMaxArea + " show=Nothing add";
+            if (excludeEdgeCells) neunOptions = neunOptions + " exclude";
+            run("Analyze Particles...", neunOptions);
+            
+            cellEnd = roiManager("Count") - 1;
+            cellCount = cellEnd - cellStart + 1;
+            if (cellCount <= 0) {
+              print("Skipped: no NeuN-positive cell bodies were detected.");
+              closeAllImages();
+              roiManager("Reset");
+              continue;
+            }
+            
+            print("DAPI nucleus candidates: " + nucleusCount);
+            print("NeuN cell candidates: " + cellCount);
+            
+            for (i = 0; i < cellCount; i++) {
+              roiManager("Select", cellStart + i);
+              roiManager("Rename", "NeuN_candidate_" + padNumber(i + 1, 4));
+            }
+            
+            // Prevent one NeuN soma from being assigned to multiple nuclei(tbd if i keep)
+            cellUsed = newArray(cellCount);
+            pairedCells = 0;
+            firstPairedROI = roiManager("Count");
+            
+            // -------------------- Match DAPI nuclei to NeuN somas --------------------
+              for (n = 0; n < nucleusCount; n++) {
+                selectImage(dapiMaskID);
+                roiManager("Select", n);
+                
+                // making sure the images are calibrated// are matching up
+                getSelectionBounds(nucBX, nucBY, nucBW, nucBH);
+                nucleusX = nucBX + nucBW / 2;
+                nucleusY = nucBY + nucBH / 2;
+                
+                matchedCellOffset = -1;
+                bestMatchPriority = -1;
+                bestMatchScore = 1e30;
+                
+                //chat script for avoiding the no selection error that sometimes occurs
+                // Priority 2: nuclear center is inside the filled NeuN ROI
+                // Priority 1: nucleus overlaps the NeuN soma's bounding region
+  // Exact containment always wins. Within the same priority, select the
+  // closest cell center. This handles NeuN rings without matching distant
+  // DAPI nuclei that have no corresponding NeuN soma.
+  for (c = 0; c < cellCount; c++) {
+    if (cellUsed[c] == 1) continue;
+    
+    selectImage(neunMaskID);
+    roiManager("Select", cellStart + c);
+    getSelectionBounds(cellBX, cellBY, cellBW, cellBH);
+    
+    cellCenterX = cellBX + cellBW / 2;
+    cellCenterY = cellBY + cellBH / 2;
+    deltaX = nucleusX - cellCenterX;
+    deltaY = nucleusY - cellCenterY;
+    distanceSquared = deltaX * deltaX + deltaY * deltaY;
+    
+    matchPriority = 0;
+    
+    if (selectionContains(nucleusX, nucleusY)) {
+      matchPriority = 2;
+    } else {
+      // Expanding the bounding test by half the nuclear width and
+      // height is equivalent to asking whether the nuclear and cell
+      // bounding regions overlap.
+      withinX = nucleusX >= cellBX - nucBW / 2 &&
+        nucleusX <= cellBX + cellBW + nucBW / 2;
+      withinY = nucleusY >= cellBY - nucBH / 2 &&
+        nucleusY <= cellBY + cellBH + nucBH / 2;
+      if (withinX && withinY) matchPriority = 1;
+    }
+    
+    if (matchPriority > bestMatchPriority ||
+        (matchPriority == bestMatchPriority && distanceSquared < bestMatchScore)) {
+      if (matchPriority > 0) {
+        bestMatchPriority = matchPriority;
+        bestMatchScore = distanceSquared;
+        matchedCellOffset = c;
+      }
+    }
+  }
+  
+  // basically saying this nucleus is not NeuN-positive, so disregard it.
+  if (matchedCellOffset < 0) continue;
+  
+  cellUsed[matchedCellOffset] = 1;
+  pairedCells++;
+  cellLabel = padNumber(pairedCells, 4);
+  
+  // duplicate and rename the matched nucleus ROI
+  roiManager("Select", n);
+  roiManager("Add");
+  nucleusROI = roiManager("Count") - 1;
+  roiManager("Select", nucleusROI);
+  roiManager("Rename", "Cell_" + cellLabel + "_Nucleus");
+  
+  // duplicate the corresponding raw NeuN soma ROI
+  roiManager("Select", cellStart + matchedCellOffset);
+  roiManager("Add");
+  rawCellROI = roiManager("Count") - 1;
+  roiManager("Select", newArray(nucleusROI, rawCellROI));
+  roiManager("OR");
+  roiManager("Add");
+  cellROI = roiManager("Count") - 1;
+  
+  // Cytoplasm = completed cell ROI minus its nucleus.
+  // On weak or fragmented NeuN images, the NeuN object may sit completely
+  // inside the nucleus. In that case Cell XOR Nucleus is empty. Never call
+  // roiManager("Add") with an empty selection because that aborts the batch.
+  roiManager("Select", newArray(cellROI, nucleusROI));
+  roiManager("XOR");
+  
+  validCytoplasm = selectionType() != -1;
+  possibleCytoArea = 0;
+  if (validCytoplasm) {
+    getStatistics(possibleCytoArea);
+    if (possibleCytoArea <= 0) validCytoplasm = false;
+  }
+  
+  if (!validCytoplasm) {
+    print("WARNING: skipped Cell_" + cellLabel +
+            " because Cell XOR Nucleus produced an empty cytoplasm ROI.");
+    
+    // At this point the temporary ROIs occur in this order:
+      // nucleusROI, rawCellROI, cellROI. Delete from highest to lowest index
+    // so each remaining stored index stays valid.
+    roiManager("Select", cellROI);
+    roiManager("Delete");
+    roiManager("Select", rawCellROI);
+    roiManager("Delete");
+    roiManager("Select", nucleusROI);
+    roiManager("Delete");
+    
+    cellUsed[matchedCellOffset] = 0;
+    pairedCells--;
+    continue;
+  }
+  
+  roiManager("Add");
+  cytoROI = roiManager("Count") - 1;
+  
+  // Remove the temporary raw NeuN ROI. The final cell and cytoplasm
+  // indices each shift down by one after this deletion.
+  roiManager("Select", rawCellROI);
+  roiManager("Delete");
+  cellROI = cellROI - 1;
+  cytoROI = cytoROI - 1;
+  
+  roiManager("Select", cellROI);
+  roiManager("Rename", "Cell_" + cellLabel + "_Cell");
+  roiManager("Select", cytoROI);
+  roiManager("Rename", "Cell_" + cellLabel + "_Cytoplasm");
+  
+  // -------------------- A1 measurements --------------------
+    selectImage(A1ID);
+  setAutoThreshold(A1Method);
+  
+  roiManager("Select", nucleusROI);
+  run("Clear Results");
+  run("Measure");
+  nucArea = getResult("Area", 0);
+  nucMean = getResult("Mean", 0);
+  nucIntDen = getResult("IntDen", 0);
+  nucPercent = getResult("%Area", 0);
+  nucPositiveArea = nucArea * nucPercent / 100;
+  
+  roiManager("Select", cellROI);
+  run("Clear Results");
+  run("Measure");
+  wholeCellArea = getResult("Area", 0);
+  cellMean = getResult("Mean", 0);
+  cellIntDen = getResult("IntDen", 0);
+  cellPercent = getResult("%Area", 0);
+  cellPositiveArea = wholeCellArea * cellPercent / 100;
+  
+  roiManager("Select", cytoROI);
+  run("Clear Results");
+  run("Measure");
+  cytoArea = getResult("Area", 0);
+  cytoMean = getResult("Mean", 0);
+  cytoIntDen = getResult("IntDen", 0);
+  cytoPercent = getResult("%Area", 0);
+  cytoPositiveArea = cytoArea * cytoPercent / 100;
+  
+  // Use -1 as the undefined sentinel when cytoplasmic mean is zero.
+  nucCytoRatio = -1;
+  if (cytoMean > 0) nucCytoRatio = nucMean / cytoMean;
+  
+  csvName = replace(baseTitle, ",", "_");
+  line =
+    csvName + "," + pairedCells + "," +
+    d2s(nucArea, 4) + "," + d2s(nucMean, 4) + "," +
+    d2s(nucIntDen, 4) + "," + d2s(nucPercent, 4) + "," +
+    d2s(nucPositiveArea, 4) + "," +
+    d2s(wholeCellArea, 4) + "," + d2s(cellMean, 4) + "," +
+    d2s(cellIntDen, 4) + "," + d2s(cellPercent, 4) + "," +
+    d2s(cellPositiveArea, 4) + "," +
+    d2s(cytoArea, 4) + "," + d2s(cytoMean, 4) + "," +
+    d2s(cytoIntDen, 4) + "," + d2s(cytoPercent, 4) + "," +
+    d2s(cytoPositiveArea, 4) + "," + d2s(nucCytoRatio, 4) + "\n";
+  File.append(line, csvFile);
+  }
+
+// Remove the unpaired candidate ROIs, leaving only the final sets:
+  // Nucleus, Cell, and Cytoplasm for each retained neuron.
+if (pairedCells > 0) {
+  originalCandidateCount = nucleusCount + cellCount;
+  candidateIndices = newArray(originalCandidateCount);
+  for (i = 0; i < originalCandidateCount; i++) candidateIndices[i] = i;
+  roiManager("Select", candidateIndices);
+  roiManager("Delete");
+  
+  // A valid retained neuron must contribute exactly three ROIs. Stop QC for
+  // this image safely if the ROI list is inconsistent, but continue the batch.
+  expectedFinalROIs = pairedCells * 3;
+  actualFinalROIs = roiManager("Count");
+  if (actualFinalROIs != expectedFinalROIs) {
+    print("WARNING: QC skipped for " + baseTitle +
+            ". Expected " + expectedFinalROIs + " final ROIs but found " +
+            actualFinalROIs + ".");
+    closeAllImages();
+    roiManager("Reset");
+    run("Clear Results");
+    continue;
+  }
+  
+  if (saveROIs) {
+    cleanBase = stripExtension(baseTitle);
+    cleanBase = replace(cleanBase, ",", "_");
+    roiManager("Save", roiDir + cleanBase + "_paired_ROIs.zip");
+  }
+  
+// FIGURES
+  // three ROIs in this order: Nucleus, Cell, Cytoplasm.
+  cleanBase = stripExtension(baseTitle);
+  cleanBase = replace(cleanBase, ",", "_");
+  
+  //DAPI with retained nuclear outlines.
+  selectWindow(dapiTitle);
+  run("Duplicate...", "title=QC_DAPI");
+  Overlay.remove;
+  for (q = 0; q < pairedCells; q++) {
+    nucleusIndex = q * 3;
+    roiManager("Select", nucleusIndex);
+    Overlay.addSelection("#ff2d2d", 1);
+  }
+  Overlay.show;
+  run("Flatten");
+  rename("QC_DAPI_flat");
+  setColor("white");
+  setFont("SansSerif", 28, "bold");
+  drawString("DAPI nuclei: " + pairedCells, 25, 40);
+  saveAs("PNG", qcDir + cleanBase + "_A_DAPI_nuclei.png");
+  close();
+  selectWindow("QC_DAPI");
+  close();
+  
+  //A1 with nuclear and cytoplasmic measurement outlines , having issues with this??
+  selectWindow(A1Title);
+  run("Duplicate...", "title=QC_A1");
+ 
+  resetThreshold();
+  run("Enhance Contrast", "saturated=0.35");
+  
+  Overlay.remove;
+  for (q = 0; q < pairedCells; q++) {
+    nucleusIndex = q * 3;
+    cytoIndex = nucleusIndex + 2;
+    roiManager("Select", nucleusIndex);
+    Overlay.addSelection("#ff2db2", 1);
+    roiManager("Select", cytoIndex);
+    Overlay.addSelection("#ffd42d", 1);
+  }
+  Overlay.show;
+  run("Flatten");
+  rename("QC_A1_flat");
+  setColor("white");
+  setFont("SansSerif", 28, "bold");
+  drawString("A1: magenta nucleus, yellow cytoplasm", 25, 40);
+  saveAs("PNG", qcDir + cleanBase + "_B_A1_compartments.png");
+  close();
+  selectWindow("QC_A1");
+  close();
+  
+  // NeuN with final cell-body outlines
+  selectWindow(neunTitle);
+  run("Duplicate...", "title=QC_NeuN");
+  Overlay.remove;
+  for (q = 0; q < pairedCells; q++) {
+    cellIndex = q * 3 + 1;
+    roiManager("Select", cellIndex);
+    Overlay.addSelection("#00e5ff", 1);
+  }
+  Overlay.show;
+  run("Flatten");
+  rename("QC_NeuN_flat");
+  setColor("white");
+  setFont("SansSerif", 28, "bold");
+  drawString("NeuN cell bodies: " + pairedCells, 25, 40);
+  saveAs("PNG", qcDir + cleanBase + "_C_NeuN_cells.png");
+  close();
+  selectWindow("QC_NeuN");
+  close();
+  
+  //  colored cytoplasm count map, one color per neuron
+  selectWindow(dapiTitle);
+  getDimensions(qcW, qcH, qcC, qcZ, qcT);
+  newImage("QC_Cytoplasm_Map", "RGB black", qcW, qcH, 1);
+  for (q = 0; q < pairedCells; q++) {
+    cytoIndex = q * 3 + 2;
+    roiManager("Select", cytoIndex);
+    
+
+    colorR = 70 + (q * 83) % 186;
+    colorG = 70 + (q * 137) % 186;
+    colorB = 70 + (q * 191) % 186;
+    setForegroundColor(colorR, colorG, colorB);
+    run("Fill");
+  }
+  run("Select None");
+  setColor("white");
+  setFont("SansSerif", 28, "bold");
+  drawString("Cytoplasm count map: " + pairedCells, 25, 40);
+  saveAs("PNG", qcDir + cleanBase + "_D_Cytoplasm_count_map.png");
+  close();
+  
+  closeAllImages();
+  open(qcDir + cleanBase + "_A_DAPI_nuclei.png");
+  open(qcDir + cleanBase + "_B_A1_compartments.png");
+  open(qcDir + cleanBase + "_C_NeuN_cells.png");
+  open(qcDir + cleanBase + "_D_Cytoplasm_count_map.png");
+  run("Images to Stack", "name=QC_Stack title=[] use");
+  run("Make Montage...", "columns=4 rows=1 scale=0.50 border=4");
+  saveAs("PNG", qcDir + cleanBase + "_QC_montage.png");
+  
+  processedImages++;
+  totalCells += pairedCells;
+  print("Retained NeuN-positive neurons: " + pairedCells);
+} else {
+  print("No DAPI nuclei could be matched to NeuN-positive cell bodies.");
+}
+
+closeAllImages();
+roiManager("Reset");
+run("Clear Results");
+}
+
+setBatchMode(false);
+print("Batch complete.");
+print("Images with retained neurons: " + processedImages);
+print("Total retained neurons: " + totalCells);
+print("CSV: " + csvFile);
+print("ROI files: " + roiDir);
+print("QC figures: " + qcDir);
+
+//helperfunctions
+  function isImageFile(name) {
+    lower = toLowerCase(name);
+    return endsWith(lower, ".tif") ||
+      endsWith(lower, ".tiff") ||
+      endsWith(lower, ".czi");
+  }
+
+function openImage(path) {
+  lower = toLowerCase(path);
+  if (endsWith(lower, ".czi")) {
+    run("Bio-Formats Importer",
+        "open=[" + path + "] autoscale color_mode=Composite view=Hyperstack stack_order=XYCZT");
+  } else {
+    open(path);
+  }
+}
+
+function closeAllImages() {
+  run("Close All");
+}
+
+function closeImageByTitle(title) {
+  if (isOpen(title)) {
+    selectWindow(title);
+    close();
+  }
+}
+
+function stripExtension(name) {
+  lower = toLowerCase(name);
+  if (endsWith(lower, ".tiff")) return substring(name, 0, lengthOf(name) - 5);
+  if (endsWith(lower, ".tif"))  return substring(name, 0, lengthOf(name) - 4);
+  if (endsWith(lower, ".czi"))  return substring(name, 0, lengthOf(name) - 4);
+  return name;
+}
+
+function padNumber(number, width) {
+  text = "" + number;
+  while (lengthOf(text) < width) text = "0" + text;
+  return text;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// IF I WANT TO ADD A FOURTH CHANNEL AS A SECOND PROTEIN TO MEASURE
+// This section is instructions only. Do not paste all of this into one place.
+// Add each part to the matching section of the script.
+
+// EXAMPLE CHANNELS:
+// C1 = DAPI
+// C2 = A1
+// C3 = NeuN
+// C4 = Protein 2
+
+// 1. UNDER "CHANNEL NUMBERS", ADD:
+// cProtein2 = 4;
+
+// 2. UNDER "THRESHOLD METHODS", ADD:
+// protein2Method = "Otsu dark";
+
+// 3. CHANGE THE CHANNEL CHECK TO:
+// if (dimC < 4) {
+//     print("Skipped: fewer than 4 channels in " + fileName);
+//     closeAllImages();
+//     continue;
+// }
+
+// 4. AFTER THE CHANNELS ARE SPLIT, ADD:
+// protein2Title = "C" + cProtein2 + "-" + baseTitle;
+
+// 5. CHANGE THE CHECK FOR THE OPEN CHANNELS TO:
+// if (!isOpen(dapiTitle) || !isOpen(A1Title) ||
+//     !isOpen(neunTitle) || !isOpen(protein2Title)) {
+//     print("Skipped: one or more expected channels were not found.");
+//     closeAllImages();
+//     continue;
+// }
+
+// 6. AFTER A1ID = getImageID(); ADD:
+// selectWindow(protein2Title);
+// protein2ID = getImageID();
+// setAutoThreshold(protein2Method);
+
+// 7. ADD THESE COLUMNS TO THE CSV HEADER:
+// Nuclear_Protein2_Mean,Nuclear_Protein2_IntDen,Nuclear_Protein2_PercentArea,
+// Cell_Protein2_Mean,Cell_Protein2_IntDen,Cell_Protein2_PercentArea,
+// Cytoplasmic_Protein2_Mean,Cytoplasmic_Protein2_IntDen,Cytoplasmic_Protein2_PercentArea,
+
+// 8. IN THE MEASUREMENT SECTION, AFTER THE A1 MEASUREMENTS, ADD:
+// selectImage(protein2ID);
+// setAutoThreshold(protein2Method);
+//
+// roiManager("Select", nucleusROI);
+// run("Clear Results");
+// run("Measure");
+// nucProtein2Mean = getResult("Mean", 0);
+// nucProtein2IntDen = getResult("IntDen", 0);
+// nucProtein2Percent = getResult("%Area", 0);
+//
+// roiManager("Select", cellROI);
+// run("Clear Results");
+// run("Measure");
+// cellProtein2Mean = getResult("Mean", 0);
+// cellProtein2IntDen = getResult("IntDen", 0);
+// cellProtein2Percent = getResult("%Area", 0);
+//
+// roiManager("Select", cytoROI);
+// run("Clear Results");
+// run("Measure");
+// cytoProtein2Mean = getResult("Mean", 0);
+// cytoProtein2IntDen = getResult("IntDen", 0);
+// cytoProtein2Percent = getResult("%Area", 0);
+
+// 9. ADD THESE VALUES TO "line =" IN THE SAME ORDER AS THE NEW CSV COLUMNS:
+// d2s(nucProtein2Mean, 4) + "," +
+// d2s(nucProtein2IntDen, 4) + "," +
+// d2s(nucProtein2Percent, 4) + "," +
+// d2s(cellProtein2Mean, 4) + "," +
+// d2s(cellProtein2IntDen, 4) + "," +
+// d2s(cellProtein2Percent, 4) + "," +
+// d2s(cytoProtein2Mean, 4) + "," +
+// d2s(cytoProtein2IntDen, 4) + "," +
+// d2s(cytoProtein2Percent, 4) + "," +
+
+// IMPORTANT:
+// Replace Protein2 in the CSV labels and variable names with the actual protein.
+// For example, if C4 is TDP, use Nuclear_TDP_Mean and nucTDPMean.
