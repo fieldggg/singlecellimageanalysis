@@ -1,0 +1,175 @@
+// Batch processing of fourrtau+ cells / Cell-type Analysis (per-ROI) with results exported to csv file
+// If you find this useful in your research please email me at gracefield@me.com, I love to hear about others projects!
+
+// in your project folder have all of your images in one file titled "images"
+//edit this path to lead to your images file, this is now the directory set for batch image processing
+path  = "/Users/gracefields/Desktop/mycelltype_experiment/images/";
+// in your project folder have an empty folder titled "results"
+// this is where the csv with all the results will be created and filled in
+path2 = "/Users/gracefields/Desktop/mycelltype_experiment/results/";
+csvFile = path2 + "MYCELLTYPE_results.csv";
+// in this case A is a glial marker like gfap, 
+// A can always be swaped with a neuronal marker to quantify neuron death, microglial to quantify activation etc
+
+// B is a protein you want to look at the expression of across cells
+// C is a secondary protein you want to see the expression of across cells AND its co-expression with B
+// 
+// The concept is we make an ROI of every cell, based on dapi
+// We expand the roi a linear amount per cell w/o overlap to form a "cell" boundary that would in theory include the cytoplasm
+// We then create a binary classifier to measure if A is being expressed above a certain threshold that would consitute it being that cell tyoe
+// We can then measure 1. the amount of B and C in A cells 2. the amount of B and C in non A cells and 3. the amount of B and C in all cells
+
+if (!File.exists(path2)) File.makeDirectory(path2);
+if (!File.exists(csvFile)) {
+  header = "Image,ROI,A_Mean,A_IntDen,B_Mean,B_IntDen,C_Mean,C_IntDen,Nucleus_Area,Cell_Type\n, C_pos\n";
+  File.saveString(header, csvFile);
+}
+
+files = getFileList(path);
+if (files.length == 0) exit("No files found in: " + path);
+
+Dialog.create("Channel Mapping and Parameters");
+Dialog.addNumber("B channel (green):", 2);
+Dialog.addNumber("C channel (red):", 3);
+Dialog.addNumber("A channel (magenta):", 4);
+Dialog.addNumber("DAPI channel (blue):", 1);
+Dialog.addNumber("Nucleus min size (area units):", 20);
+Dialog.addNumber("Nucleus max size (area units):", 4000);
+Dialog.show();
+
+cB = Dialog.getNumber();
+cC = Dialog.getNumber();
+cA = Dialog.getNumber();
+cDAPI = Dialog.getNumber();
+nucMin = Dialog.getNumber();
+nucMax = Dialog.getNumber();
+
+function isImageFile(name) {
+  lname = toLowerCase(name);
+  return endsWith(lname, ".tif") || endsWith(lname, ".tiff") ||
+    endsWith(lname, ".nd2") || endsWith(lname, ".lif");
+}
+function titleFor(ch, baseTitle) { return "C" + ch + "-" + baseTitle; }
+
+for (f = 0; f < files.length; f++) {
+  if (!isImageFile(files[f])) continue;
+  
+  open(path + files[f]);
+  baseID = getImageID();
+  baseTitle = getTitle();
+  
+  run("Split Channels");
+  
+  tB = titleFor(cB, baseTitle);
+  tC = titleFor(cC, baseTitle);
+  tA = titleFor(cA, baseTitle);
+  tDAPI = titleFor(cDAPI, baseTitle);
+  
+  if (!isOpen(tDAPI)) {
+    run("Close All");
+    roiManager("Reset");
+    run("Clear Results");
+    print("Skipped " + baseTitle + " (DAPI channel not found).");
+    continue;
+  }
+  
+  
+  selectWindow(tDAPI);
+  run("Duplicate...", "title=DAPI_work");
+  dapiID = getImageID();
+  
+  selectImage(dapiID);
+  
+  setOption("BlackBackground", true);
+  run("Convert to Mask");
+  run("Fill Holes");
+  run("Watershed");
+  
+  roiManager("Reset");
+  run("Analyze Particles...", "size=" + nucMin + "-" + nucMax + " show=Nothing add exclude");
+  numROIs = roiManager("Count");
+  if (numROIs == 0) {
+    run("Close All");
+    roiManager("Reset");
+    run("Clear Results");
+    print("No nuclei in " + baseTitle + ". Skipped.");
+    continue;
+  }
+  
+  // expand ROIs
+  for (i = 0; i < 24; i++) run("Dilate");
+  run("Fill Holes");
+  for (i = 0; i < 24; i++) run("Dilate");
+  run("Fill Holes");
+  
+  run("Clear Results");
+  run("Set Measurements...", "area mean integrated redirect=None decimal=3");
+  
+  if (!isOpen(tB) || !isOpen(tC) || !isOpen(tA)) {
+    run("Close All");
+    roiManager("Reset");
+    run("Clear Results");
+    print("Missing channel(s) for " + baseTitle + ". Skipped.");
+    continue;
+  }
+// SET THESE BASED ON YOUR POS CONTROL
+// to find these values, go and open your image in ImageJ
+// help -> threshold -> dark background + otsu -> move the max until you have proper coverage of your staining in 'red', whatever value that occurs at is your threshold
+  selectWindow(tB); run("Threshold..."); setThreshold(18,225); idB = getImageID();
+  selectWindow(tC); run("Threshold..."); setThreshold(7,225); idC = getImageID();
+  selectWindow(tA); setAutoThreshold("MaxEntropy"); idA = getImageID();
+  
+  nucArea = newArray(numROIs);
+  BMean = newArray(numROIs); BInt = newArray(numROIs);
+  CMean = newArray(numROIs); CInt = newArray(numROIs);
+  AMean = newArray(numROIs); AInt = newArray(numROIs); 
+  
+  for (j = 0; j < numROIs; j++) {
+    selectImage(dapiID);  roiManager("Select", j); run("Measure"); row = nResults-1; nucArea[j] = getResult("Area", row);
+    selectImage(idB);  roiManager("Select", j); run("Measure"); row = nResults-1; BMean[j] = getResult("Mean", row); BInt[j] = getResult("IntDen", row);
+    selectImage(idC);  roiManager("Select", j); run("Measure"); row = nResults-1; CMean[j] = getResult("Mean", row); CInt[j] = getResult("IntDen", row);
+    selectImage(idA);  roiManager("Select", j); run("Measure");row = nResults-1; AMean[j] = getResult("Mean", row); AInt[j] = getResult("IntDen", row);
+  }
+  
+  run("Clear Results");
+  for (j = 0; j < numROIs; j++) {
+    cell_type = "0";
+    if (AMean[j] > 11 ) cell_type = "astrocyte"; //based on whatever your A is
+    if (AMean[j] > 11 && BMean[j] > 13 ) cell_type = "angry astrocyte"; //based on what you would infer if A and B are co-expressing increase 
+  // can also change > to < and measure downregulation:)
+    
+    C_pos = "0"; //change this for whatever fun antibody you have been called to
+    if (AMean[j] >11 && BMean[j] <13 && CInt[j] >230) C_pos = "C A(i.e. tau astrocyte"; // put your own info in here
+    if (AMean[j] >11 && BMean[j] >13 && CInt[j] > 230) C_pos = "i.e. tau angry astrocyte";
+    
+    
+    line = baseTitle + "," + (j+1) + "," +
+      d2s(AMean[j],3) + "," + d2s(AInt[j],3) + "," +
+      d2s(BMean[j],3) + "," + d2s(BInt[j],3) + "," +
+      d2s(CMean[j],3) + "," + d2s(CInt[j],3) + "," +
+      d2s(nucArea[j],3) + "," + cell_type + "\n";
+    File.append(line, csvFile);
+    
+    setResult("Image", j, baseTitle);
+    setResult("ROI", j, j+1);
+    setResult("A Mean", j, AMean[j]);
+    setResult("A IntDen", j, AInt[j]);
+    setResult("B Mean", j, BMean[j]);
+    setResult("B IntDen", j, BInt[j]);
+    setResult("C Mean", j, CMean[j]);
+    setResult("C IntDen", j, CInt[j]);
+    setResult("Nucleus Area", j, nucArea[j]);
+    setResult("Cell Type", j, cell_type);
+    setResult("Tau Positive", j, tau_pos); //change to your niche measurement!
+  }
+  updateResults(); 
+  
+  
+  if (isOpen("Results")) { selectWindow("Results"); run("Summarize"); }
+  
+  
+  run("Close All");      // closes all image windows
+  roiManager("Reset");
+  run("Clear Results");
+}
+print("Batch complete. CSV saved to: " + csvFile);
