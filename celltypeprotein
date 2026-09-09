@@ -1,0 +1,349 @@
+// Gfields DPR clearance x cell type specificity script
+// Measures proteinmarker1, GFAP, and NeuN inside DAPI-derived ROIs.
+// Also assigns a cell type to every ROI and saves one row per ROI to a CSV.
+
+// Folder containing the original multichannel TIFF images
+path = "/Users/gracefields/Desktop/DPRclearance/images/";
+
+// Folder where the CSV will be saved
+path2 = "/Users/gracefields/Desktop/DPRclearance/results/";
+csvFile = path2 + "DPRClearance_raw_pixel_results.csv";
+
+// Make sure a failed run did not leave old split-channel windows open.
+// Old windows can cause Fiji to select an already converted DAPI mask.
+if (nImages > 0) {
+  exit("Close all open image windows in Fiji, then run the macro again.");
+}
+
+// Make sure the input and output folders exist
+if (!File.exists(path)) {
+  exit("Input folder not found:\n" + path);
+}
+
+if (!File.exists(path2)) {
+  File.makeDirectory(path2);
+}
+
+// Make the output CSV and header if it does not already exist
+if (!File.exists(csvFile)) {
+  header = "Image,ROI,Nucleus_Area,Cell_ROI_Pixel_Count," +
+    "proteinmarker1_Mean,proteinmarker1_Median,proteinmarker1_Min,proteinmarker1_Max,proteinmarker1_StdDev,proteinmarker1_Mode,proteinmarker1_IntDen,proteinmarker1_RawIntDen," +
+    "GFAP_Mean,GFAP_Median,GFAP_Min,GFAP_Max,GFAP_StdDev,GFAP_Mode,GFAP_IntDen,GFAP_RawIntDen," +
+    "NeuN_Mean,NeuN_Median,NeuN_Min,NeuN_Max,NeuN_StdDev,NeuN_Mode,NeuN_IntDen,NeuN_RawIntDen," +
+    "Cell_Type\n";
+  File.saveString(header, csvFile);
+}
+
+files = getFileList(path);
+
+if (files.length == 0) {
+  exit("No files found in:\n" + path +
+         "\nCheck that the files have been properly converted to TIFF files.");
+}
+
+// Lil dialog so I can input the parameters based on the image size
+Dialog.create("Key for Image Analysis of DPR Clearance");
+Dialog.addNumber("DAPI channel (350):", 1);
+Dialog.addNumber("proteinmarker1 channel (488):", 2);
+Dialog.addNumber("GFAP channel (568):", 3);
+Dialog.addNumber("NeuN channel (648):", 4);
+Dialog.addNumber("Nucleus minimum area (pixels squared):", 5);
+Dialog.addNumber("Nucleus maximum area (pixels squared):", 4000);
+Dialog.addNumber("Dilation of ROI boundary (pixels):", 5);
+Dialog.show();
+
+// Fetching back any values changed for a test run
+cDAPI = Dialog.getNumber();
+cproteinmarker1 = Dialog.getNumber();
+cGFAP = Dialog.getNumber();
+cNeuN = Dialog.getNumber();
+nucMin = Dialog.getNumber();
+nucMax = Dialog.getNumber();
+enlargePx = Dialog.getNumber();
+
+// Helper function to make sure a file is a TIFF
+function isImageFile(name) {
+  lname = toLowerCase(name);
+  return endsWith(lname, ".tif") || endsWith(lname, ".tiff");
+}
+
+// Helper function for matching an antibody to its split-channel title
+function titleFor(ch, baseTitle) {
+  return "C" + ch + "-" + baseTitle;
+}
+
+// Set measurements once before beginning the batch.
+// There is intentionally NO "limit" option here.
+// Every marker measurement therefore uses every raw pixel inside the ROI.
+run("Set Measurements...",
+    "area mean standard modal min integrated median redirect=None decimal=3");
+roiManager("Reset");
+run("Clear Results");
+
+// Batch process every TIFF in the input folder
+for (f = 0; f < files.length; f++) {
+  
+  if (!isImageFile(files[f])) {
+    continue;
+  }
+  
+  open(path + files[f]);
+  baseTitle = getTitle();
+  print("Processing: " + baseTitle);
+  
+  run("Split Channels");
+  
+  tDAPI = titleFor(cDAPI, baseTitle);
+  tproteinmarker1 = titleFor(cproteinmarker1, baseTitle);
+  tGFAP = titleFor(cGFAP, baseTitle);
+  tNeuN = titleFor(cNeuN, baseTitle);
+  
+  // Make sure all four expected channels were found
+  if (!isOpen(tDAPI) || !isOpen(tproteinmarker1) ||
+      !isOpen(tGFAP) || !isOpen(tNeuN)) {
+    
+    print(baseTitle + " is missing at least one expected channel. Skipped.");
+    run("Close All");
+    roiManager("Reset");
+    run("Clear Results");
+    continue;
+  }
+  
+  // Make one nuclear ROI per DAPI object
+  selectWindow(tDAPI);
+  dapiID = getImageID();
+  resetThreshold();
+  
+  // Otsu is calculated separately for every image.
+  // Bright nuclei are treated as foreground on a dark background.
+  setAutoThreshold("Otsu dark");
+  getThreshold(dapiLower, dapiUpper);
+  print("DAPI Otsu threshold for " + baseTitle + ": " +
+          dapiLower + " to " + dapiUpper);
+  
+  setOption("BlackBackground", true);
+  run("Convert to Mask");
+  run("Fill Holes");
+  run("Watershed");
+  
+  // Create one ROI for each DAPI object
+  roiManager("Reset");
+  run("Analyze Particles...",
+      "size=" + nucMin + "-" + nucMax +
+        " show=Nothing add exclude");
+  
+  numROIs = roiManager("Count");
+  print("DAPI ROIs found in " + baseTitle + ": " + numROIs);
+  
+  if (numROIs == 0) {
+    print("No nuclei detected in " + baseTitle + ". Image skipped.");
+    run("Close All");
+    roiManager("Reset");
+    run("Clear Results");
+    continue;
+  }
+  
+  // Make every output array once, outside all measurement loops
+  nucArea = newArray(numROIs);
+  cellPixelCount = newArray(numROIs);
+  
+  proteinmarker1Mean = newArray(numROIs);
+  proteinmarker1Median = newArray(numROIs);
+  proteinmarker1Min = newArray(numROIs);
+  proteinmarker1Max = newArray(numROIs);
+  proteinmarker1StdDev = newArray(numROIs);
+  proteinmarker1Mode = newArray(numROIs);
+  proteinmarker1IntDen = newArray(numROIs);
+  proteinmarker1RawIntDen = newArray(numROIs);
+  
+  gfapMean = newArray(numROIs);
+  gfapMedian = newArray(numROIs);
+  gfapMin = newArray(numROIs);
+  gfapMax = newArray(numROIs);
+  gfapStdDev = newArray(numROIs);
+  gfapMode = newArray(numROIs);
+  gfapIntDen = newArray(numROIs);
+  gfapRawIntDen = newArray(numROIs);
+  
+  neunMean = newArray(numROIs);
+  neunMedian = newArray(numROIs);
+  neunMin = newArray(numROIs);
+  neunMax = newArray(numROIs);
+  neunStdDev = newArray(numROIs);
+  neunMode = newArray(numROIs);
+  neunIntDen = newArray(numROIs);
+  neunRawIntDen = newArray(numROIs);
+  
+  // Measure the original, non-dilated nuclear area
+  run("Clear Results");
+  selectImage(dapiID);
+  
+  for (j = 0; j < numROIs; j++) {
+    roiManager("Select", j);
+    run("Measure");
+    row = nResults - 1;
+    nucArea[j] = getResult("Area", row);
+  }
+  
+  // Optionally enlarge every ROI before measuring the marker channels
+  if (enlargePx > 0) {
+    selectImage(dapiID);
+    
+    for (j = 0; j < numROIs; j++) {
+      roiManager("Select", j);
+      run("Enlarge...", "enlarge=" + enlargePx);
+      roiManager("Update");
+    }
+  }
+  
+  // Measure proteinmarker1 inside every ROI
+  run("Clear Results");
+  selectWindow(tproteinmarker1);
+  resetThreshold();
+  
+  for (j = 0; j < numROIs; j++) {
+    roiManager("Select", j);
+    getRawStatistics(rawPixelCount, rawMean, rawMin, rawMax, rawStdDev);
+    run("Measure");
+    row = nResults - 1;
+    cellPixelCount[j] = rawPixelCount;
+    proteinmarker1Mean[j] = rawMean;
+    proteinmarker1Median[j] = getResult("Median", row);
+    proteinmarker1Min[j] = rawMin;
+    proteinmarker1Max[j] = rawMax;
+    proteinmarker1StdDev[j] = rawStdDev;
+    proteinmarker1Mode[j] = getResult("Mode", row);
+    proteinmarker1IntDen[j] = getResult("IntDen", row);
+    proteinmarker1RawIntDen[j] = rawMean * rawPixelCount;
+  }
+  
+  // Measure GFAP inside every ROI
+  run("Clear Results");
+  selectWindow(tGFAP);
+  resetThreshold();
+  
+  for (j = 0; j < numROIs; j++) {
+    roiManager("Select", j);
+    getRawStatistics(rawPixelCount, rawMean, rawMin, rawMax, rawStdDev);
+    run("Measure");
+    row = nResults - 1;
+    gfapMean[j] = rawMean;
+    gfapMedian[j] = getResult("Median", row);
+    gfapMin[j] = rawMin;
+    gfapMax[j] = rawMax;
+    gfapStdDev[j] = rawStdDev;
+    gfapMode[j] = getResult("Mode", row);
+    gfapIntDen[j] = getResult("IntDen", row);
+    gfapRawIntDen[j] = rawMean * rawPixelCount;
+  }
+  
+  // Measure NeuN inside every ROI
+  run("Clear Results");
+  selectWindow(tNeuN);
+  resetThreshold();
+  
+  for (j = 0; j < numROIs; j++) {
+    roiManager("Select", j);
+    getRawStatistics(rawPixelCount, rawMean, rawMin, rawMax, rawStdDev);
+    run("Measure");
+    row = nResults - 1;
+    neunMean[j] = rawMean;
+    neunMedian[j] = getResult("Median", row);
+    neunMin[j] = rawMin;
+    neunMax[j] = rawMax;
+    neunStdDev[j] = rawStdDev;
+    neunMode[j] = getResult("Mode", row);
+    neunIntDen[j] = getResult("IntDen", row);
+    neunRawIntDen[j] = rawMean * rawPixelCount;
+  }
+  
+  // Save one CSV row per ROI
+  // Neuron is checked first because the original cutoffs overlap.
+  // This reproduces the original script's final classification priority.
+    run("Clear Results");
+
+    for (j = 0; j < numROIs; j++) {
+        cellType = "unclassified";
+
+        if (gfapMean[j] < 20 && neunMean[j] > 8) {
+            cellType = "neuron";
+        } else if (gfapMean[j] > 12 && neunMean[j] < 14) {
+            cellType = "astrocyte";
+        } else if (gfapMean[j] < 12 && neunMean[j] < 9) {
+            cellType = "other(glial)";
+        }
+
+        csvLine = baseTitle + "," + (j + 1) + "," +
+            d2s(nucArea[j], 3) + "," +
+            d2s(cellPixelCount[j], 0) + "," +
+            d2s(proteinmarker1Mean[j], 3) + "," +
+            d2s(proteinmarker1Median[j], 3) + "," +
+            d2s(proteinmarker1Min[j], 3) + "," +
+            d2s(proteinmarker1Max[j], 3) + "," +
+            d2s(proteinmarker1StdDev[j], 3) + "," +
+            d2s(proteinmarker1Mode[j], 3) + "," +
+            d2s(proteinmarker1IntDen[j], 3) + "," +
+            d2s(proteinmarker1RawIntDen[j], 3) + "," +
+            d2s(gfapMean[j], 3) + "," +
+            d2s(gfapMedian[j], 3) + "," +
+            d2s(gfapMin[j], 3) + "," +
+            d2s(gfapMax[j], 3) + "," +
+            d2s(gfapStdDev[j], 3) + "," +
+            d2s(gfapMode[j], 3) + "," +
+            d2s(gfapIntDen[j], 3) + "," +
+            d2s(gfapRawIntDen[j], 3) + "," +
+            d2s(neunMean[j], 3) + "," +
+            d2s(neunMedian[j], 3) + "," +
+            d2s(neunMin[j], 3) + "," +
+            d2s(neunMax[j], 3) + "," +
+            d2s(neunStdDev[j], 3) + "," +
+            d2s(neunMode[j], 3) + "," +
+            d2s(neunIntDen[j], 3) + "," +
+            d2s(neunRawIntDen[j], 3) + "," +
+            cellType + "\n";
+
+        File.append(csvLine, csvFile);
+
+        setResult("Image", j, baseTitle);
+        setResult("ROI", j, j + 1);
+        setResult("Nucleus Area", j, nucArea[j]);
+        setResult("Cell ROI Pixel Count", j, cellPixelCount[j]);
+        setResult("proteinmarker1 Mean", j, proteinmarker1Mean[j]);
+        setResult("proteinmarker1 Median", j, proteinmarker1Median[j]);
+        setResult("proteinmarker1 Min", j, proteinmarker1Min[j]);
+        setResult("proteinmarker1 Max", j, proteinmarker1Max[j]);
+        setResult("proteinmarker1 StdDev", j, proteinmarker1StdDev[j]);
+        setResult("proteinmarker1 Mode", j, proteinmarker1Mode[j]);
+        setResult("proteinmarker1 IntDen", j, proteinmarker1IntDen[j]);
+        setResult("proteinmarker1 RawIntDen", j, proteinmarker1RawIntDen[j]);
+        setResult("GFAP Mean", j, gfapMean[j]);
+        setResult("GFAP Median", j, gfapMedian[j]);
+        setResult("GFAP Min", j, gfapMin[j]);
+        setResult("GFAP Max", j, gfapMax[j]);
+        setResult("GFAP StdDev", j, gfapStdDev[j]);
+        setResult("GFAP Mode", j, gfapMode[j]);
+        setResult("GFAP IntDen", j, gfapIntDen[j]);
+        setResult("GFAP RawIntDen", j, gfapRawIntDen[j]);
+        setResult("NeuN Mean", j, neunMean[j]);
+        setResult("NeuN Median", j, neunMedian[j]);
+        setResult("NeuN Min", j, neunMin[j]);
+        setResult("NeuN Max", j, neunMax[j]);
+        setResult("NeuN StdDev", j, neunStdDev[j]);
+        setResult("NeuN Mode", j, neunMode[j]);
+        setResult("NeuN IntDen", j, neunIntDen[j]);
+        setResult("NeuN RawIntDen", j, neunRawIntDen[j]);
+        setResult("Cell Type", j, cellType);
+    }
+
+    updateResults();
+    print("Finished: " + baseTitle);
+
+    // Cleanup before the next image
+    run("Close All");
+    roiManager("Reset");
+    run("Clear Results");
+}
+
+print("Batch complete. CSV saved to: " + csvFile);
+showMessage("DPR clearance analysis complete",
+            "CSV saved to:\n" + csvFile);
